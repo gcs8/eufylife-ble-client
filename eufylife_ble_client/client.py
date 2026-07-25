@@ -104,6 +104,69 @@ RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError,)
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_ATTEMPTS = 3
 
+T9130_FINAL_FLAG = 0x04
+T9130_IMPEDANCE_FLAG = 0x40
+T9130_HEART_RATE_FLAG = 0x80
+T9130_MIN_PACKET_LENGTH = 18
+T9130_IMPEDANCE_PACKET_LENGTH = 19
+T9130_LIVE_MANUFACTURER_ID = 0xBC4D
+T9130_BODY_MANUFACTURER_ID = 0xBC4F
+T9130_MANUFACTURER_IDS = frozenset(
+    {T9130_LIVE_MANUFACTURER_ID, T9130_BODY_MANUFACTURER_ID}
+)
+T9130_OBSERVED_STATUSES = frozenset({0x01, 0x05, 0x15, 0x25, 0x65, 0xA5})
+
+
+def _parse_t9130_advertisement(data: bytearray) -> EufyLifeBLEState | None:
+    """Parse a Smart Scale C20 advertisement payload."""
+    if len(data) < T9130_MIN_PACKET_LENGTH:
+        return None
+
+    flags = data[10]
+    if flags not in T9130_OBSERVED_STATUSES:
+        return None
+    has_impedance_data = bool(
+        flags & (T9130_IMPEDANCE_FLAG | T9130_HEART_RATE_FLAG)
+    )
+    if has_impedance_data and len(data) < T9130_IMPEDANCE_PACKET_LENGTH:
+        return None
+
+    weight_kg = ((data[13] << 8) | data[12]) / 100
+    if weight_kg == 0:
+        return None
+
+    heart_rate = (
+        (data[15] or None) if flags & T9130_HEART_RATE_FLAG else None
+    )
+    impedance_ohm = (
+        ((data[18] << 8) | data[17]) / 10 or None
+        if has_impedance_data
+        else None
+    )
+
+    return EufyLifeBLEState(
+        weight_kg=weight_kg,
+        final_weight_kg=weight_kg if flags & T9130_FINAL_FLAG else None,
+        heart_rate=heart_rate,
+        max_weight_exceeded=False,
+        impedance_ohm=impedance_ohm,
+    )
+
+
+def _t9130_state_priority(
+    manufacturer_id: int, data: bytearray, state: EufyLifeBLEState
+) -> tuple[bool, int, bool, int]:
+    """Prefer final/body-composition frames over simultaneous live frames."""
+    is_final = state.final_weight_kg is not None
+    optional_measurements = sum(
+        value is not None for value in (state.impedance_ohm, state.heart_rate)
+    )
+    preferred_family = manufacturer_id == (
+        T9130_BODY_MANUFACTURER_ID if is_final else T9130_LIVE_MANUFACTURER_ID
+    )
+    return is_final, optional_measurements, preferred_family, len(data)
+
+
 class EufyLifeBLEDevice:
     _operation_lock = asyncio.Lock()
     _state = EufyLifeBLEState()
@@ -140,7 +203,12 @@ class EufyLifeBLEDevice:
     @property
     def supports_heart_rate(self) -> bool:
         """Return whether the device supports heart rate measurements."""
-        return self._model_id == "eufy T9149"
+        return self._model_id in ["eufy T9130", "eufy T9149"]
+
+    @property
+    def supports_impedance(self) -> bool:
+        """Return whether the device supports impedance measurements."""
+        return self._model_id == "eufy T9130"
 
     @property
     def is_connected(self) -> bool:
@@ -271,9 +339,26 @@ class EufyLifeBLEDevice:
 
         values = list(manufacturer_data.values())
 
+        if self._model_id == "eufy T9130":
+            candidates = []
+            for manufacturer_id, data in manufacturer_data.items():
+                if manufacturer_id not in T9130_MANUFACTURER_IDS:
+                    continue
+                if state := _parse_t9130_advertisement(data):
+                    candidates.append((manufacturer_id, data, state))
+            if not candidates:
+                return
+            _, data, state = max(
+                candidates,
+                key=lambda candidate: _t9130_state_priority(*candidate),
+            )
+            _LOGGER.debug("Handling advertisement data: %s", data.hex())
+            self._set_state_and_fire_callbacks(state)
+            return
+
         if len(values) > 1:
             _LOGGER.debug("Multiple advertisement packets found: %s", values)
-            if self._model_id in ["eufy T9130", "eufy T9150"]:
+            if self._model_id == "eufy T9150":
                 valid_data = next((data for data in values if len(data) >= 18 and data[10] in [0x01, 0x05]), None)
                 if valid_data is None:
                     return
@@ -285,7 +370,7 @@ class EufyLifeBLEDevice:
 
         _LOGGER.debug("Handling advertisement data: %s", data.hex())
 
-        if self._model_id in ["eufy T9130", "eufy T9150"]:
+        if self._model_id == "eufy T9150":
             if len(data) >= 18 and data[10] in [0x01, 0x05]:
                 self._handle_advertisement_weight_update_t9130_t9150(data)
         elif self._model_id in ["eufy T9146", "eufy T9147"]:
