@@ -114,13 +114,13 @@ class EufyLifeBLEDevice:
     _battery_char: BleakGATTCharacteristic | None = None
     _disconnect_timer: asyncio.TimerHandle | None = None
     _client: BleakClientWithServiceCache | None = None
-    _callbacks: list[Callable[[EufyLifeBLEState], None]] = []
     _battery_level: int | None = None
 
     def __init__(self, model: str) -> None:
         """Initialize the EufyLifeBLEDevice."""
         self._model_id = model
         self._model = MODELS[model]
+        self._callbacks: list[Callable[[EufyLifeBLEState], None]] = []
 
         self._loop = asyncio.get_running_loop()
 

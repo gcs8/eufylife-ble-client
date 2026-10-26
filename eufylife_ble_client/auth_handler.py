@@ -11,10 +11,9 @@ _LOGGER = logging.getLogger(__name__)
 IV = b"0000000000000000"
 
 class AuthHandler:
-    _c1_data = bytearray()
-
     def __init__(self, address: str, loop: asyncio.AbstractEventLoop) -> None:
         self._address = address
+        self._c1_data = bytearray()
         self._c1_future = loop.create_future()
         self._c3_future = loop.create_future()
 
